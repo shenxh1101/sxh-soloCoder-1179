@@ -7,6 +7,7 @@ from typing import Optional
 import click
 import questionary
 
+from template_gen.audit import audit_project, print_audit_report, repair_manifest
 from template_gen.config import (
     discover_builtin_templates,
     discover_external_template,
@@ -271,7 +272,8 @@ def list_templates():
 @main.command()
 @click.option("-t", "--template", default=None, help="Template name or path")
 @click.option("--ci", is_flag=True, help="CI mode: exit 0=clean, 1=errors found, 2=warnings only")
-def validate(template: Optional[str], ci: bool):
+@click.option("--json", "json_output", is_flag=True, help="Output validation results as JSON")
+def validate(template: Optional[str], ci: bool, json_output: bool):
     """Validate a template configuration. Checks YAML, variables, conditions, rendering, and post-commands."""
     _print_banner()
 
@@ -281,9 +283,9 @@ def validate(template: Optional[str], ci: bool):
     click.secho(f"\n  Validating: {config.name} (v{config.version})", fg="cyan", bold=True)
 
     issues = validate_template(template_info["path"])
-    exit_code = print_validation_report(issues, config.name)
+    exit_code = print_validation_report(issues, config.name, json_output=json_output)
 
-    if ci:
+    if ci or json_output:
         raise SystemExit(exit_code)
 
 
@@ -449,6 +451,41 @@ def diff(project_dir: str, template: str, no_interactive: bool):
     click.secho("  Run 'template-gen update' to apply these changes.", fg="cyan", bold=True)
 
 
+# ── audit ───────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("project_dir")
+@click.option("--repair", is_flag=True, help="Repair the manifest: remove missing entries, add orphaned files")
+@click.option("--json", "json_output", is_flag=True, help="Output audit results as JSON")
+def audit(project_dir: str, repair: bool, json_output: bool):
+    """Audit a generated project: report file states and manifest consistency."""
+    _print_banner()
+
+    project_path = Path(project_dir).resolve()
+    if not project_path.exists():
+        click.secho(f"Project directory not found: {project_dir}", fg="red")
+        raise SystemExit(1)
+
+    if repair:
+        result = repair_manifest(str(project_path))
+        if result["repaired"]:
+            click.secho(f"\n  \033[92mManifest repaired.\033[0m", fg="green")
+            click.secho(f"  Removed {result['removed_missing']} missing entries")
+            click.secho(f"  Added {result['added_orphaned']} orphaned files as user_created")
+        else:
+            click.secho(f"\n  \033[93m{result.get('reason', 'Repair failed')}\033[0m", fg="yellow")
+        return
+
+    audit_data = audit_project(str(project_path))
+
+    if json_output:
+        import json
+        audit_data.pop("has_manifest", None)
+        print(json.dumps(audit_data, indent=2, ensure_ascii=False, default=str))
+    else:
+        print_audit_report(audit_data)
+
+
 # ── update ──────────────────────────────────────────────────────────────────
 
 @main.command()
@@ -511,7 +548,7 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
         interactive=not no_interactive,
     )
 
-    if not dry_run and (result["changed"] or result["added"] or result["skipped"]):
+    if not dry_run and (result["changed"] or result["added"] or result["skipped"] or result.get("resolved_conflicts")):
         classification = result.get("classifications", {})
         update_manifest_after_update(
             project_dir=str(project_path),
@@ -527,6 +564,7 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
                 "user_only": result.get("user_only", []),
                 "skipped": result.get("skipped", []),
             },
+            resolved_conflicts=result.get("resolved_conflicts", []),
         )
 
     if result["backup"]:

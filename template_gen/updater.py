@@ -61,7 +61,7 @@ def print_diff_preview(
     template_name: str,
     template_version: str,
 ) -> None:
-    """Print a detailed diff preview grouped by action: overwrite, add, keep, remove."""
+    """Print a detailed diff preview grouped by action: overwrite, add, keep, remove, conflict."""
     classification = classify_project_files(project_dir, new_render)
     state_map = _get_state_map(project_dir)
 
@@ -71,6 +71,13 @@ def print_diff_preview(
     template_removed = classification["template_removed"]
     user_only = classification["user_only"]
 
+    conflict_collisions: List[str] = []
+    for path in changed:
+        if state_map.get(path) == "user":
+            conflict_collisions.append(path)
+
+    remaining_changed = [p for p in changed if p not in conflict_collisions]
+
     total = len(unchanged) + len(changed) + len(template_new) + len(template_removed) + len(user_only)
 
     print(f"\n  {'='*50}")
@@ -79,9 +86,16 @@ def print_diff_preview(
     print(f"  Total tracked files: {total}")
     print(f"  {'='*50}")
 
-    if changed:
-        print(f"\n  \033[93m[OVERWRITE]  {len(changed)} file(s) — template changed, will be overwritten\033[0m")
-        for f in changed:
+    if conflict_collisions:
+        print(f"\n  \033[95m[CONFLICT]   {len(conflict_collisions)} file(s) — user file collides with template\033[0m")
+        for f in conflict_collisions:
+            tag = state_map.get(f, "")
+            tag_str = f"  \033[90m[{tag}]\033[0m" if tag else ""
+            print(f"     !! {f}{tag_str}  →  pick: keep user / save as .template-new / overwrite")
+
+    if remaining_changed:
+        print(f"\n  \033[93m[OVERWRITE]  {len(remaining_changed)} file(s) — template changed, will be overwritten\033[0m")
+        for f in remaining_changed:
             tag = state_map.get(f, "")
             extra = _describe_modification(project_dir, f, new_render.get(f, ""))
             tag_str = f"  \033[90m[{tag}]\033[0m" if tag else ""
@@ -114,7 +128,7 @@ def print_diff_preview(
 
     print(f"\n  \033[90m{'─'*50}\033[0m")
 
-    has_impact = bool(changed or template_new or template_removed)
+    has_impact = bool(conflict_collisions or remaining_changed or template_new or template_removed)
     if not has_impact:
         print("  \033[92mNo changes needed — project is up to date.\033[0m")
 
@@ -171,6 +185,14 @@ def incremental_update(
     template_removed = classification["template_removed"]
     user_only = classification["user_only"]
 
+    conflict_collisions: List[str] = []
+    for path in changed:
+        if state_map.get(path) == "user":
+            conflict_collisions.append(path)
+
+    for path in conflict_collisions:
+        changed.remove(path)
+
     has_changes = bool(changed or template_new or template_removed or user_only)
 
     if not has_changes:
@@ -193,10 +215,19 @@ def incremental_update(
     applied_changed: List[str] = []
     applied_added: List[str] = []
     applied_removed: List[str] = []
+    resolved_conflicts: List[Dict[str, str]] = []
 
     _print_update_header(
-        changed, template_new, template_removed, user_only, state_map, project_dir, backup_dir
+        changed, template_new, template_removed, user_only, state_map, project_dir, backup_dir, conflict_collisions
     )
+
+    if conflict_collisions:
+        for rel_path in conflict_collisions:
+            resolution = _resolve_name_conflict(
+                rel_path, project_path, new_files.get(rel_path, ""), interactive, dry_run
+            )
+            if not dry_run and resolution:
+                resolved_conflicts.append({rel_path: resolution})
 
     for rel_path in changed:
         apply = _ask_file_action(
@@ -237,7 +268,7 @@ def incremental_update(
         else:
             skipped.append(rel_path)
 
-    _print_update_result(applied_changed, applied_added, applied_removed, skipped, user_only)
+    _print_update_result(applied_changed, applied_added, applied_removed, skipped, user_only, resolved_conflicts)
 
     return {
         "backup": backup_dir,
@@ -247,8 +278,55 @@ def incremental_update(
         "removed": applied_removed,
         "skipped": skipped,
         "user_only": user_only,
+        "resolved_conflicts": resolved_conflicts,
         "classifications": classification,
     }
+
+
+def _resolve_name_conflict(
+    rel_path: str,
+    project_path: Path,
+    new_content: str,
+    interactive: bool,
+    dry_run: bool,
+) -> Optional[Dict[str, str]]:
+    """
+    Handle a file name collision between a user-created file and a new template file.
+    Returns a dict with the resolution action, or None if nothing was done.
+    """
+    if not interactive:
+        print(f"  \033[95m[CONFLICT]\033[0m '{rel_path}' — user file collides with template, keeping user file")
+        return {"action": "keep_user", "path": rel_path}
+
+    print(f"\n  \033[95m╔══ NAME CONFLICT ═══════════════════════════════════╗\033[0m")
+    print(f"  \033[95m║  '{rel_path}'                                      ║\033[0m")
+    print(f"  \033[95m║  A user-created file has the same name as a new   ║\033[0m")
+    print(f"  \033[95m║  template file. Choose how to resolve:            ║\033[0m")
+    print(f"  \033[95m╚═══════════════════════════════════════════════════╝\033[0m")
+    print(f"  \033[93m  1)\033[0m Keep user file (discard template version)")
+    print(f"  \033[92m  2)\033[0m Save template as '{rel_path}.template-new'")
+    print(f"  \033[91m  3)\033[0m Overwrite user file with template")
+
+    choice = input("  Choice [1/2/3] (default=1): ").strip()
+
+    if choice == "2":
+        alt_path = rel_path + ".template-new"
+        if not dry_run:
+            target = project_path / alt_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_content, encoding="utf-8")
+        print(f"  \033[92m  Template file saved as '{alt_path}'\033[0m")
+        return {"action": "save_as_alternate", "path": rel_path, "alternate_path": alt_path}
+    elif choice == "3":
+        if not dry_run:
+            target = project_path / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_content, encoding="utf-8")
+        print(f"  \033[93m  User file overwritten with template.\033[0m")
+        return {"action": "overwrite_user", "path": rel_path}
+    else:
+        print(f"  \033[96m  User file preserved.\033[0m")
+        return {"action": "keep_user", "path": rel_path}
 
 
 def _print_update_header(
@@ -259,10 +337,13 @@ def _print_update_header(
     state_map: Dict[str, str],
     project_dir: str,
     backup_dir: Optional[str],
+    conflict_collisions: Optional[List[str]] = None,
 ) -> None:
     print(f"\n  \033[1mApplying changes to: {Path(project_dir).resolve()}\033[0m")
     if backup_dir:
         print(f"  \033[90mBackup: {backup_dir}\033[0m")
+    if conflict_collisions:
+        print(f"  \033[95m{len(conflict_collisions)} name conflict(s) — user files collide with template\033[0m")
     if changed:
         print(f"  \033[93m{len(changed)} file(s) to overwrite\033[0m")
     if template_new:
@@ -330,6 +411,7 @@ def _print_update_result(
     applied_removed: List[str],
     skipped: List[str],
     user_only: List[str],
+    resolved_conflicts: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     print(f"\n  \033[92mUpdate complete.\033[0m")
     if applied_changed:
@@ -338,6 +420,8 @@ def _print_update_result(
         print(f"    {len(applied_added)} file(s) added")
     if applied_removed:
         print(f"    {len(applied_removed)} file(s) removed")
+    if resolved_conflicts:
+        print(f"    {len(resolved_conflicts)} conflict(s) resolved")
     if skipped:
         print(f"    {len(skipped)} file(s) skipped")
     if user_only:

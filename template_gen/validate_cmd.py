@@ -334,10 +334,41 @@ def _validate_post_commands(config: TemplateConfig) -> List[ValidationIssue]:
 
 # ── report printer ──────────────────────────────────────────────────────────
 
-def print_validation_report(issues: List[ValidationIssue], template_name: str) -> int:
+def issues_to_dict(issues: List[ValidationIssue], template_name: str) -> Dict[str, Any]:
+    """Build a JSON-serializable dict from validation issues."""
+    errors = [i for i in issues if i.level == "error"]
+    warnings = [i for i in issues if i.level == "warning"]
+
+    by_category: Dict[str, Dict[str, List[str]]] = {}
+    for issue in errors:
+        by_category.setdefault(issue.category, {"errors": [], "warnings": []})
+        by_category[issue.category]["errors"].append(issue.message)
+    for issue in warnings:
+        by_category.setdefault(issue.category, {"errors": [], "warnings": []})
+        by_category[issue.category]["warnings"].append(issue.message)
+
+    exit_code = 1 if errors else (2 if warnings else 0)
+
+    return {
+        "template": template_name,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "exit_code": exit_code,
+        "categories": by_category,
+    }
+
+
+def print_validation_report(
+    issues: List[ValidationIssue], template_name: str, json_output: bool = False
+) -> int:
     """Print a formatted validation report grouped by category.
     Returns exit code: 0=clean, 1=errors, 2=warnings only.
     """
+    if json_output:
+        import json
+        print(json.dumps(issues_to_dict(issues, template_name), indent=2, ensure_ascii=False))
+        return issues_to_dict(issues, template_name)["exit_code"]
+
     if not issues:
         print(f"\n  \033[92m✓ Template '{template_name}' passed all checks.\033[0m\n")
         return 0

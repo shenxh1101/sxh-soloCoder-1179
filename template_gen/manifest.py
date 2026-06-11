@@ -180,18 +180,22 @@ def update_manifest_after_update(
     variables: Dict[str, Any],
     new_render: Dict[str, str],
     classifications: Dict[str, Any],
+    resolved_conflicts: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
     Update the manifest after an incremental update.
     - New template files → template_original
-    - Overwritten files that were user_modified → stays user_modified (user changed them before)
-    - Files skipped (user chose not to overwrite) → keep existing state, mark as user_modified if template changed
+    - Overwritten files that were user_modified → stays user_modified
+    - Skipped files → keep existing state, mark as user_modified if template changed
     - User-only files → keep user_created
-    - Template files that match the new render → template_original
+    - Conflict: keep_user → stays user_created
+    - Conflict: overwrite_user → becomes template_original
+    - Conflict: save_as_alternate → alternate path added as template_original
     """
 
     project_path = Path(project_dir).resolve()
     manifest = load_manifest(project_dir)
+    resolved_conflicts = resolved_conflicts or []
 
     old_entries: Dict[str, Dict[str, str]] = {}
     if manifest:
@@ -232,6 +236,40 @@ def update_manifest_after_update(
                     new_manifest_files[rel_path] = dict(prev_entry)
             else:
                 new_manifest_files[rel_path] = _file_entry(template_hash, "template_original")
+
+    for conflict in resolved_conflicts:
+        if not conflict:
+            continue
+        path = conflict.get("path", "")
+        action = conflict.get("action", "")
+        template_content = new_render.get(path, "")
+        template_hash = _hash_content(template_content) if template_content else ""
+
+        if action == "keep_user":
+            prev_entry = old_entries.get(path)
+            if prev_entry:
+                new_manifest_files[path] = dict(prev_entry)
+            else:
+                existing = project_path / path
+                if existing.exists():
+                    new_manifest_files[path] = _file_entry(
+                        _hash_content(existing.read_text(encoding="utf-8")), "user_created"
+                    )
+        elif action == "overwrite_user":
+            new_manifest_files[path] = _file_entry(template_hash, "template_original")
+        elif action == "save_as_alternate":
+            alt = conflict.get("alternate_path", "")
+            if alt:
+                new_manifest_files[alt] = _file_entry(template_hash, "template_original")
+            prev_entry = old_entries.get(path)
+            if prev_entry:
+                new_manifest_files[path] = dict(prev_entry)
+            else:
+                existing = project_path / path
+                if existing.exists():
+                    new_manifest_files[path] = _file_entry(
+                        _hash_content(existing.read_text(encoding="utf-8")), "user_created"
+                    )
 
     for rel_path in user_only_set:
         if rel_path not in new_manifest_files:
