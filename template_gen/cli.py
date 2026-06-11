@@ -1,5 +1,6 @@
 """CLI entry point for template-gen using Click."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -7,7 +8,15 @@ from typing import Optional
 import click
 import questionary
 
-from template_gen.audit import audit_project, print_audit_report, repair_manifest
+from template_gen.audit import (
+    audit_project,
+    audit_workspace,
+    preview_repair,
+    print_audit_report,
+    print_repair_preview,
+    print_workspace_audit_report,
+    repair_manifest,
+)
 from template_gen.config import (
     discover_builtin_templates,
     discover_external_template,
@@ -128,7 +137,8 @@ def _load_presets_interactive(current_template_name: str) -> Optional[dict]:
         click.secho(f"\n  ⚠  {mismatch}", fg="yellow")
         proceed = questionary.confirm("Continue with this preset anyway?", default=False).unsafe_ask()
         if not proceed:
-            return None
+            click.secho("  Cancelled.", fg="yellow")
+            raise SystemExit(0)
 
     data = load_preset(preset_name)
     if data is None:
@@ -275,12 +285,14 @@ def list_templates():
 @click.option("--json", "json_output", is_flag=True, help="Output validation results as JSON")
 def validate(template: Optional[str], ci: bool, json_output: bool):
     """Validate a template configuration. Checks YAML, variables, conditions, rendering, and post-commands."""
-    _print_banner()
+    if not json_output:
+        _print_banner()
 
     template_info = _resolve_template(template)
     config = load_template_config(template_info["config_file"])
 
-    click.secho(f"\n  Validating: {config.name} (v{config.version})", fg="cyan", bold=True)
+    if not json_output:
+        click.secho(f"\n  Validating: {config.name} (v{config.version})", fg="cyan", bold=True)
 
     issues = validate_template(template_info["path"])
     exit_code = print_validation_report(issues, config.name, json_output=json_output)
@@ -456,30 +468,65 @@ def diff(project_dir: str, template: str, no_interactive: bool):
 @main.command()
 @click.argument("project_dir")
 @click.option("--repair", is_flag=True, help="Repair the manifest: remove missing entries, add orphaned files")
+@click.option("--confirm", is_flag=True, help="Skip the dry-run preview and confirmation prompt when repairing")
+@click.option("--workspace", "workspace_mode", is_flag=True, help="Treat PROJECT_DIR as a workspace and scan all sub-projects")
 @click.option("--json", "json_output", is_flag=True, help="Output audit results as JSON")
-def audit(project_dir: str, repair: bool, json_output: bool):
-    """Audit a generated project: report file states and manifest consistency."""
-    _print_banner()
-
+def audit(project_dir: str, repair: bool, confirm: bool, workspace_mode: bool, json_output: bool):
+    """Audit a generated project or workspace: report file states and manifest consistency."""
     project_path = Path(project_dir).resolve()
     if not project_path.exists():
-        click.secho(f"Project directory not found: {project_dir}", fg="red")
+        click.secho(f"Directory not found: {project_dir}", fg="red")
         raise SystemExit(1)
 
-    if repair:
-        result = repair_manifest(str(project_path))
-        if result["repaired"]:
-            click.secho(f"\n  \033[92mManifest repaired.\033[0m", fg="green")
-            click.secho(f"  Removed {result['removed_missing']} missing entries")
-            click.secho(f"  Added {result['added_orphaned']} orphaned files as user_created")
+    if workspace_mode:
+        if not json_output:
+            _print_banner()
+        ws_audit = audit_workspace(str(project_path))
+        if json_output:
+            print(json.dumps(ws_audit, indent=2, ensure_ascii=False, default=str))
         else:
-            click.secho(f"\n  \033[93m{result.get('reason', 'Repair failed')}\033[0m", fg="yellow")
+            print_workspace_audit_report(ws_audit)
         return
+
+    if repair:
+        if not json_output:
+            _print_banner()
+
+        preview = preview_repair(str(project_path))
+
+        if json_output:
+            print(json.dumps(preview, indent=2, ensure_ascii=False, default=str))
+            result = repair_manifest(str(project_path))
+            print(json.dumps({"applied": result}, indent=2, ensure_ascii=False, default=str))
+        else:
+            print_repair_preview(preview)
+
+            if not confirm and (preview.get("would_remove") or preview.get("would_add")):
+                proceed = questionary.confirm(
+                    "Apply these repairs to the manifest?", default=False
+                ).unsafe_ask()
+                if not proceed:
+                    click.secho("  Repair cancelled.", fg="yellow")
+                    return
+
+            result = repair_manifest(str(project_path))
+            if result["repaired"]:
+                click.secho(f"\n  \033[92mManifest repaired.\033[0m", fg="green")
+                click.secho(f"  Removed {result['removed_missing']} missing entries")
+                click.secho(f"  Added {result['added_orphaned']} orphaned files as user_created")
+            else:
+                click.secho(f"\n  \033[93m{result.get('reason', 'Repair failed')}\033[0m", fg="yellow")
+        return
+
+    if not json_output:
+        _print_banner()
+    else:
+        # suppress banner for json mode
+        pass
 
     audit_data = audit_project(str(project_path))
 
     if json_output:
-        import json
         audit_data.pop("has_manifest", None)
         print(json.dumps(audit_data, indent=2, ensure_ascii=False, default=str))
     else:
@@ -494,7 +541,10 @@ def audit(project_dir: str, repair: bool, json_output: bool):
 @click.option("--no-backup", is_flag=True, help="Skip creating a backup before updating")
 @click.option("--no-interactive", is_flag=True, help="Apply all changes without prompting")
 @click.option("--dry-run", is_flag=True, help="Show what would change without applying")
-def update(project_dir: str, template: str, no_backup: bool, no_interactive: bool, dry_run: bool):
+@click.option("--conflict-strategy", type=click.Choice(["keep_user", "save_alternate", "preview_only"]),
+              default="keep_user", help="How to handle file name conflicts (non-interactive mode)")
+def update(project_dir: str, template: str, no_backup: bool, no_interactive: bool, dry_run: bool,
+           conflict_strategy: str):
     """Incrementally update an existing project from its template."""
     _print_banner()
 
@@ -546,6 +596,7 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
         backup=not no_backup,
         dry_run=dry_run,
         interactive=not no_interactive,
+        conflict_strategy=conflict_strategy,
     )
 
     if not dry_run and (result["changed"] or result["added"] or result["skipped"] or result.get("resolved_conflicts")):

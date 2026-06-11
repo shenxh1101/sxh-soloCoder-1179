@@ -23,11 +23,12 @@ from template_gen.validator import validate_variable
 
 
 class ValidationIssue:
-    def __init__(self, level: str, category: str, message: str, detail: str = ""):
+    def __init__(self, level: str, category: str, message: str, detail: str = "", file_hint: str = ""):
         self.level = level   # error, warning
         self.category = category   # yaml, variable, condition, template, post_command, reference
         self.message = message
         self.detail = detail
+        self.file_hint = file_hint
 
 
 def validate_template(template_dir: str) -> List[ValidationIssue]:
@@ -214,6 +215,7 @@ def _validate_template_rendering(
                 "error", "template",
                 f"Render error in '{rel_path}'",
                 detail=content,
+                file_hint=rel_path,
             ))
 
     return issues
@@ -335,22 +337,37 @@ def _validate_post_commands(config: TemplateConfig) -> List[ValidationIssue]:
 # ── report printer ──────────────────────────────────────────────────────────
 
 def issues_to_dict(issues: List[ValidationIssue], template_name: str) -> Dict[str, Any]:
-    """Build a JSON-serializable dict from validation issues."""
+    """Build a JSON-serializable dict from validation issues with per-issue detail."""
     errors = [i for i in issues if i.level == "error"]
     warnings = [i for i in issues if i.level == "warning"]
 
-    by_category: Dict[str, Dict[str, List[str]]] = {}
-    for issue in errors:
-        by_category.setdefault(issue.category, {"errors": [], "warnings": []})
-        by_category[issue.category]["errors"].append(issue.message)
-    for issue in warnings:
-        by_category.setdefault(issue.category, {"errors": [], "warnings": []})
-        by_category[issue.category]["warnings"].append(issue.message)
+    def _issue_entry(i: ValidationIssue) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "level": i.level,
+            "category": i.category,
+            "message": i.message,
+        }
+        if i.detail:
+            entry["detail"] = i.detail.strip()
+        if i.file_hint:
+            entry["file"] = i.file_hint
+        return entry
+
+    by_category: Dict[str, Dict[str, Any]] = {}
+    for cat in sorted({i.category for i in issues}):
+        cat_errors = [i for i in errors if i.category == cat]
+        cat_warnings = [i for i in warnings if i.category == cat]
+        by_category[cat] = {
+            "error_count": len(cat_errors),
+            "warning_count": len(cat_warnings),
+            "items": [_issue_entry(i) for i in issues if i.category == cat],
+        }
 
     exit_code = 1 if errors else (2 if warnings else 0)
 
     return {
         "template": template_name,
+        "total_issues": len(issues),
         "error_count": len(errors),
         "warning_count": len(warnings),
         "exit_code": exit_code,

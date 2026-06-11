@@ -191,6 +191,7 @@ def update_manifest_after_update(
     - Conflict: keep_user → stays user_created
     - Conflict: overwrite_user → becomes template_original
     - Conflict: save_as_alternate → alternate path added as template_original
+    - Conflict: preview_only → keep existing entry unchanged
     """
 
     project_path = Path(project_dir).resolve()
@@ -246,6 +247,16 @@ def update_manifest_after_update(
         template_hash = _hash_content(template_content) if template_content else ""
 
         if action == "keep_user":
+            prev_entry = old_entries.get(path)
+            if prev_entry:
+                new_manifest_files[path] = dict(prev_entry)
+            else:
+                existing = project_path / path
+                if existing.exists():
+                    new_manifest_files[path] = _file_entry(
+                        _hash_content(existing.read_text(encoding="utf-8")), "user_created"
+                    )
+        elif action == "preview_only":
             prev_entry = old_entries.get(path)
             if prev_entry:
                 new_manifest_files[path] = dict(prev_entry)

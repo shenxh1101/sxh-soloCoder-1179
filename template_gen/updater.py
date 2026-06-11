@@ -165,12 +165,20 @@ def incremental_update(
     backup: bool = True,
     dry_run: bool = False,
     interactive: bool = True,
+    conflict_strategy: str = "keep_user",
 ) -> Dict[str, Any]:
     """
     Incrementally update a project. Uses manifest to distinguish template
     files from user-created files. Backs up the project first, then overwrites
     only changed/new template files. User-only files are always protected.
+
+    conflict_strategy (for non-interactive / suppressed-conflict mode):
+        keep_user      – keep user-created files, discard template version
+        save_alternate – save template file as <name>.template-new
+        preview_only   – do not resolve conflicts, report them in result
     """
+    if conflict_strategy not in ("keep_user", "save_alternate", "preview_only"):
+        raise ValueError(f"Invalid conflict_strategy: {conflict_strategy}")
     project_path = Path(project_dir).resolve()
 
     if not project_path.exists():
@@ -224,7 +232,7 @@ def incremental_update(
     if conflict_collisions:
         for rel_path in conflict_collisions:
             resolution = _resolve_name_conflict(
-                rel_path, project_path, new_files.get(rel_path, ""), interactive, dry_run
+                rel_path, project_path, new_files.get(rel_path, ""), interactive, dry_run, conflict_strategy
             )
             if not dry_run and resolution:
                 resolved_conflicts.append({rel_path: resolution})
@@ -289,14 +297,28 @@ def _resolve_name_conflict(
     new_content: str,
     interactive: bool,
     dry_run: bool,
+    conflict_strategy: str = "keep_user",
 ) -> Optional[Dict[str, str]]:
     """
     Handle a file name collision between a user-created file and a new template file.
     Returns a dict with the resolution action, or None if nothing was done.
+    In non-interactive mode, uses conflict_strategy to decide.
     """
     if not interactive:
-        print(f"  \033[95m[CONFLICT]\033[0m '{rel_path}' — user file collides with template, keeping user file")
-        return {"action": "keep_user", "path": rel_path}
+        if conflict_strategy == "preview_only":
+            print(f"  \033[95m[CONFLICT]\033[0m '{rel_path}' — user file collides with template (preview_only, skipping)")
+            return {"action": "preview_only", "path": rel_path}
+        elif conflict_strategy == "save_alternate":
+            alt_path = rel_path + ".template-new"
+            if not dry_run:
+                target = project_path / alt_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(new_content, encoding="utf-8")
+            print(f"  \033[95m[CONFLICT]\033[0m '{rel_path}' — user file collides with template, template saved as '{alt_path}'")
+            return {"action": "save_as_alternate", "path": rel_path, "alternate_path": alt_path}
+        else:
+            print(f"  \033[95m[CONFLICT]\033[0m '{rel_path}' — user file collides with template, keeping user file (strategy: keep_user)")
+            return {"action": "keep_user", "path": rel_path}
 
     print(f"\n  \033[95m╔══ NAME CONFLICT ═══════════════════════════════════╗\033[0m")
     print(f"  \033[95m║  '{rel_path}'                                      ║\033[0m")
