@@ -1,8 +1,15 @@
-"""Template validator: checks YAML config, conditions, renderability, and post-commands."""
+"""Template validator: checks YAML config, conditions, renderability, and post-commands.
+
+Exit codes (for CI):
+  0 = no issues
+  1 = errors found
+  2 = only warnings found
+"""
 
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from jinja2 import Environment, BaseLoader
 
@@ -17,8 +24,8 @@ from template_gen.validator import validate_variable
 
 class ValidationIssue:
     def __init__(self, level: str, category: str, message: str, detail: str = ""):
-        self.level = level  # error, warning
-        self.category = category  # yaml, variable, condition, template, post_command
+        self.level = level   # error, warning
+        self.category = category   # yaml, variable, condition, template, post_command, reference
         self.message = message
         self.detail = detail
 
@@ -42,9 +49,12 @@ def validate_template(template_dir: str) -> List[ValidationIssue]:
     issues.extend(_validate_conditions(config))
     issues.extend(_validate_template_rendering(template_dir, config))
     issues.extend(_validate_post_commands(config))
+    issues.extend(_validate_variable_usage(template_dir, config))
 
     return issues
 
+
+# ── variable definitions ────────────────────────────────────────────────────
 
 def _validate_variable_definitions(config: TemplateConfig) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
@@ -53,79 +63,119 @@ def _validate_variable_definitions(config: TemplateConfig) -> List[ValidationIss
         if var.kind not in ("text", "confirm", "select", "password", "int", "float"):
             issues.append(ValidationIssue(
                 "warning", "variable",
-                f"Variable '{var.name}' has unknown kind '{var.kind}'"
+                f"'{var.name}' has unknown kind '{var.kind}'",
             ))
 
         if var.kind == "select" and not var.choices and not (var.validation and var.validation.choices):
             issues.append(ValidationIssue(
                 "warning", "variable",
-                f"Variable '{var.name}' is kind='select' but has no choices defined"
+                f"'{var.name}' is kind='select' but has no choices defined",
             ))
 
         if var.kind in ("int", "float") and var.validation and var.validation.kind == "range":
-            v = var.validation
             msg = validate_variable(var, var.default)
             if msg:
                 issues.append(ValidationIssue(
                     "error", "variable",
-                    f"Variable '{var.name}' default value '{var.default}' fails validation: {msg}"
+                    f"'{var.name}' default value '{var.default}' fails its own validation: {msg}",
                 ))
 
         if var.validation and var.validation.kind == "regex":
-            import re as _re
             try:
-                _re.compile(var.validation.pattern or "")
-            except _re.error:
+                re.compile(var.validation.pattern or "")
+            except re.error:
                 issues.append(ValidationIssue(
                     "error", "variable",
-                    f"Variable '{var.name}' has invalid regex pattern: {var.validation.pattern}"
+                    f"'{var.name}' has invalid regex pattern: {var.validation.pattern}",
+                ))
+
+        if var.kind in ("int", "float") and isinstance(var.default, str) and var.default == "":
+            msg = validate_variable(var, var.default)
+            if msg:
+                issues.append(ValidationIssue(
+                    "warning", "variable",
+                    f"'{var.name}' has empty string as default but is kind='{var.kind}', will fail validation at prompt",
                 ))
 
     return issues
 
+
+# ── condition expressions ───────────────────────────────────────────────────
 
 def _validate_conditions(config: TemplateConfig) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
     env = Environment(loader=BaseLoader())
 
+    declared_vars = {var.name for var in config.variables}
     context: Dict[str, Any] = {}
     for var in config.variables:
-        if var.name not in context:
-            context[var.name] = var.default
+        context[var.name] = var.default
 
     for var in config.variables:
         if not var.condition:
             continue
 
-        try:
-            cond = env.from_string(
-                "{{% if {} %}}1{{% else %}}0{{% endif %}}".format(var.condition)
-            )
-            cond.render(**context)
-        except Exception as e:
-            issues.append(ValidationIssue(
-                "error", "condition",
-                f"Variable '{var.name}' has invalid condition expression: {var.condition}",
-                detail=str(e),
-            ))
+        cond_issues = _check_condition_expr(env, var.condition, context, declared_vars, f"variable '{var.name}'")
+        issues.extend(cond_issues)
 
     for i, cmd in enumerate(config.post_commands):
         if not cmd.condition:
             continue
-        try:
-            cond = env.from_string(
-                "{{% if {} %}}1{{% else %}}0{{% endif %}}".format(cmd.condition)
-            )
-            cond.render(**context)
-        except Exception as e:
+
+        label = f"post-command '{cmd.description or cmd.command}'"
+        cond_issues = _check_condition_expr(env, cmd.condition, context, declared_vars, label)
+        issues.extend(cond_issues)
+
+    return issues
+
+
+def _check_condition_expr(
+    env: Environment,
+    condition: str,
+    context: Dict[str, Any],
+    declared_vars: set,
+    label: str,
+) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+
+    try:
+        tmpl = env.from_string(
+            "{{% if {} %}}1{{% else %}}0{{% endif %}}".format(condition)
+        )
+        tmpl.render(**context)
+    except Exception as e:
+        issues.append(ValidationIssue(
+            "error", "condition",
+            f"Condition on {label} is invalid: '{condition}'",
+            detail=str(e),
+        ))
+
+    refs = _extract_jinja2_expression_refs(condition)
+    for ref_name in refs:
+        if ref_name not in declared_vars:
             issues.append(ValidationIssue(
                 "error", "condition",
-                f"Post-command #{i+1} ('{cmd.description or cmd.command}') has invalid condition: {cmd.condition}",
-                detail=str(e),
+                f"Condition on {label} references undeclared variable '{ref_name}': '{condition}'",
             ))
 
     return issues
 
+
+def _extract_jinja2_expression_refs(expr: str) -> set:
+    """Extract variable names from a Jinja2 expression like 'use_docker == true'."""
+    return set(re.findall(r"\b([a-zA-Z_]\w*)\b", expr)) - {
+        "true", "false", "True", "False", "None", "none",
+        "and", "or", "not", "is", "in",
+        "if", "else", "elif", "for", "while",
+        "def", "class", "import", "from", "as", "with",
+        "try", "except", "finally", "raise", "return",
+        "yield", "lambda", "pass", "break", "continue",
+        "len", "int", "str", "float", "bool", "list", "dict",
+        "set", "tuple", "type", "range", "print", "hasattr",
+    }
+
+
+# ── template rendering ──────────────────────────────────────────────────────
 
 def _validate_template_rendering(
     template_dir: str, config: TemplateConfig
@@ -140,7 +190,7 @@ def _validate_template_rendering(
     if not os.path.isdir(template_subdir):
         issues.append(ValidationIssue(
             "error", "template",
-            f"Template subdirectory 'template/' not found in {template_dir}"
+            "Template subdirectory 'template/' not found",
         ))
         return issues
 
@@ -154,7 +204,7 @@ def _validate_template_rendering(
     except Exception as e:
         issues.append(ValidationIssue(
             "error", "template",
-            f"Failed to render template files: {e}"
+            f"Failed to render template files: {e}",
         ))
         return issues
 
@@ -166,37 +216,50 @@ def _validate_template_rendering(
                 detail=content,
             ))
 
-    all_raw = _read_all_template_sources(template_subdir)
+    return issues
 
-    context_vars = set(var.name for var in config.variables)
+
+# ── variable usage analysis ─────────────────────────────────────────────────
+
+def _validate_variable_usage(
+    template_dir: str, config: TemplateConfig
+) -> List[ValidationIssue]:
+    """Check: which variables are unused, and which template refs are undeclared."""
+    issues: List[ValidationIssue] = []
+
+    template_subdir = os.path.join(template_dir, "template")
+    if not os.path.isdir(template_subdir):
+        return issues
+
+    all_sources = _read_all_template_sources(template_subdir)
+    declared_vars = {var.name for var in config.variables}
 
     for var in config.variables:
-        ref_count = _count_var_refs(all_raw, var.name)
+        ref_count = _count_var_refs_in_source(all_sources, var.name)
         if ref_count == 0:
             issues.append(ValidationIssue(
-                "warning", "template",
-                f"Variable '{var.name}' is defined but never referenced in any template file"
+                "warning", "reference",
+                f"Variable '{var.name}' is declared but never referenced in any template file",
             ))
 
-    all_refs = _extract_all_template_refs(all_raw)
+    all_refs = _extract_all_template_refs(all_sources)
     for ref_name in sorted(all_refs):
-        if ref_name not in context_vars:
-            if _has_default_filter(all_raw, ref_name):
+        if ref_name not in declared_vars:
+            if _has_default_filter(all_sources, ref_name):
                 issues.append(ValidationIssue(
-                    "warning", "template",
-                    f"Template references variable '{{{{ {ref_name} }}}}' which is not defined (has default filter, will use fallback)"
+                    "warning", "reference",
+                    f"Template references '{ref_name}' which is not declared (uses default filter → fallback value)",
                 ))
             else:
                 issues.append(ValidationIssue(
-                    "error", "template",
-                    f"Template references undefined variable '{{{{ {ref_name} }}}}'"
+                    "error", "reference",
+                    f"Template references undeclared variable '{{{{ {ref_name} }}}}' — will be empty at render time",
                 ))
 
     return issues
 
 
 def _read_all_template_sources(template_subdir: str) -> str:
-    """Read all template source files into one string for analysis."""
     sources = []
     for root, dirs, files in os.walk(template_subdir):
         for fname in files:
@@ -209,23 +272,39 @@ def _read_all_template_sources(template_subdir: str) -> str:
     return "\n".join(sources)
 
 
-def _count_var_refs(all_sources: str, var_name: str) -> int:
-    import re
+def _count_var_refs_in_source(all_sources: str, var_name: str) -> int:
     count = 0
-    for m in re.finditer(r"\{\{\s*" + re.escape(var_name) + r"(\s*\||\s*\}\}|\s*\})", all_sources):
+    for m in re.finditer(
+        r"\{\{\s*" + re.escape(var_name) + r"(\s*\||\s*\}\}|\s*\})", all_sources
+    ):
         count += 1
-    for m in re.finditer(r"\{\%\s*(?:if|elif|for)\s+.*\b" + re.escape(var_name) + r"\b", all_sources):
+    for m in re.finditer(
+        r"\{\%\s*(?:if|elif|for)\s+.*\b" + re.escape(var_name) + r"\b", all_sources
+    ):
         count += 1
     return count
 
 
 def _has_default_filter(all_sources: str, var_name: str) -> bool:
-    import re
     return bool(re.search(
         r"\{\{\s*" + re.escape(var_name) + r"\s*\|",
         all_sources,
     ))
 
+
+def _extract_all_template_refs(content: str) -> set:
+    refs = set()
+    for match in re.finditer(r"\{\{\s*(\w+)\s*(\|[^}]*)?\}\}", content):
+        refs.add(match.group(1))
+    for match in re.finditer(r"\{\%\s*(?:if|elif|for)\s+.*?\b(\w+)\b", content):
+        refs.add(match.group(1))
+    return refs - {
+        "true", "false", "True", "False", "None",
+        "and", "or", "not", "is", "in", "if", "else",
+    }
+
+
+# ── post commands ───────────────────────────────────────────────────────────
 
 def _validate_post_commands(config: TemplateConfig) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
@@ -234,17 +313,17 @@ def _validate_post_commands(config: TemplateConfig) -> List[ValidationIssue]:
 
     for i, cmd in enumerate(config.post_commands):
         try:
-            rendered = env.from_string(cmd.command).render(**context)
+            env.from_string(cmd.command).render(**context)
         except Exception as e:
             issues.append(ValidationIssue(
                 "error", "post_command",
-                f"Post-command #{i+1} has invalid Jinja2 in command: {cmd.command}",
+                f"Post-command #{i+1} has invalid Jinja2 in command string: {cmd.command}",
                 detail=str(e),
             ))
 
         if cmd.condition:
             try:
-                rendered = env.from_string(
+                env.from_string(
                     "{{% if {} %}}1{{% else %}}0{{% endif %}}".format(cmd.condition)
                 ).render(**context)
             except Exception:
@@ -253,28 +332,14 @@ def _validate_post_commands(config: TemplateConfig) -> List[ValidationIssue]:
     return issues
 
 
-def _find_jinja2_refs(rendered_files: Dict[str, str], var_name: str) -> List[str]:
-    refs = []
-    for path, content in rendered_files.items():
-        if "{{%s}}" % var_name in content or "{{ %s }}" % var_name in content:
-            refs.append(path)
-    return refs
-
-
-def _extract_all_template_refs(content: str) -> set:
-    import re
-    refs = set()
-    for match in re.finditer(r"\{\{\s*(\w+)\s*(\|[^}]*)?\}\}", content):
-        refs.add(match.group(1))
-    for match in re.finditer(r"\{\%\s*(?:if|elif|for)\s+(\w+)", content):
-        refs.add(match.group(1))
-    return refs
-
+# ── report printer ──────────────────────────────────────────────────────────
 
 def print_validation_report(issues: List[ValidationIssue], template_name: str) -> int:
-    """Print a formatted validation report. Returns exit code (0 = ok, 1 = errors)."""
+    """Print a formatted validation report grouped by category.
+    Returns exit code: 0=clean, 1=errors, 2=warnings only.
+    """
     if not issues:
-        print(f"\n  \033[92m✓ Template '{template_name}' passed all checks.\033[0m")
+        print(f"\n  \033[92m✓ Template '{template_name}' passed all checks.\033[0m\n")
         return 0
 
     errors = [i for i in issues if i.level == "error"]
@@ -283,11 +348,46 @@ def print_validation_report(issues: List[ValidationIssue], template_name: str) -
     print(f"\n  Template: \033[1m{template_name}\033[0m")
     print(f"  \033[91m{len(errors)} error(s)\033[0m  \033[93m{len(warnings)} warning(s)\033[0m")
 
-    for issue in issues:
-        icon = "\033[91m✗\033[0m" if issue.level == "error" else "\033[93m⚠\033[0m"
-        print(f"\n  {icon} [{issue.category}] {issue.message}")
-        if issue.detail:
-            for line in issue.detail.strip().split("\n")[:5]:
-                print(f"    \033[90m{line}\033[0m")
+    _print_section("Errors", errors, "error")
+    _print_section("Warnings", warnings, "warning")
 
-    return 1 if errors else 0
+    print()
+
+    if errors:
+        return 1
+    return 2
+
+
+def _print_section(title: str, items: List[ValidationIssue], level: str) -> None:
+    if not items:
+        return
+
+    icon = "\033[91m✗\033[0m" if level == "error" else "\033[93m⚠\033[0m"
+
+    by_category: Dict[str, List[ValidationIssue]] = {}
+    for i in items:
+        by_category.setdefault(i.category, []).append(i)
+
+    print(f"\n  {icon} {title} ({len(items)}) {'─' * 40}")
+
+    for category in ("yaml", "variable", "condition", "template", "reference", "post_command"):
+        cat_issues = by_category.get(category, [])
+        if not cat_issues:
+            continue
+        cat_label = _CATEGORY_LABELS.get(category, category)
+        print(f"    [{cat_label}]")
+        for issue in cat_issues:
+            print(f"      • {issue.message}")
+            if issue.detail:
+                for line in issue.detail.strip().split("\n")[:3]:
+                    print(f"        \033[90m{line.strip()}\033[0m")
+
+
+_CATEGORY_LABELS = {
+    "yaml": "Config YAML",
+    "variable": "Variable Definitions",
+    "condition": "Condition Expressions",
+    "template": "Template Rendering",
+    "reference": "Variable References",
+    "post_command": "Post Commands",
+}

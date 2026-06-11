@@ -1,5 +1,6 @@
 """CLI entry point for template-gen using Click."""
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -26,14 +27,14 @@ from template_gen.preset import (
     load_preset,
     save_preset,
 )
-from template_gen.updater import incremental_update
+from template_gen.updater import incremental_update, print_diff_preview
 from template_gen.validate_cmd import print_validation_report, validate_template
 
 
 def _print_banner():
     click.echo()
     click.secho("  ╔══════════════════════════════════╗", fg="cyan")
-    click.secho("  ║     Template Generator  v0.1     ║", fg="cyan")
+    click.secho("  ║     Template Generator  v0.2     ║", fg="cyan")
     click.secho("  ╚══════════════════════════════════╝", fg="cyan")
     click.echo()
 
@@ -69,10 +70,7 @@ def _resolve_template(template_name: Optional[str] = None) -> dict:
 
     choices.append(questionary.Choice(title="Browse external template...", value="__external__"))
 
-    selected = questionary.select(
-        "Select a template:",
-        choices=choices,
-    ).unsafe_ask()
+    selected = questionary.select("Select a template:", choices=choices).unsafe_ask()
 
     if selected == "__external__":
         path_input = questionary.text("Enter path to external template directory:").unsafe_ask()
@@ -85,9 +83,16 @@ def _resolve_template(template_name: Optional[str] = None) -> dict:
     return selected
 
 
-def _load_presets_interactive(template_name: str) -> Optional[dict]:
-    presets = list_presets()
-    if not presets:
+def _load_presets_interactive(current_template_name: str) -> Optional[dict]:
+    """Show presets filtered to match the current template (or warn on mismatch)."""
+    all_presets = list_presets()
+    if not all_presets:
+        return None
+
+    matching = [p for p in all_presets if p["template_name"].lower() == current_template_name.lower()]
+    non_matching = [p for p in all_presets if p not in matching]
+
+    if not matching and not non_matching:
         return None
 
     use_preset = questionary.confirm("Use a saved preset?", default=False).unsafe_ask()
@@ -95,17 +100,30 @@ def _load_presets_interactive(template_name: str) -> Optional[dict]:
         return None
 
     choices = []
-    for p in presets:
-        label = f"{p['name']} ({p['template_name']} v{p.get('template_version', '?')})"
-        choices.append(questionary.Choice(title=label, value=p["name"]))
+    if matching:
+        for p in matching:
+            ver = f" v{p.get('template_version', '?')}"
+            choices.append(questionary.Choice(
+                title=f"{p['name']} → {p['template_name']}{ver}  \033[92m(match)\033[0m",
+                value=p["name"],
+            ))
+
+    if non_matching:
+        for p in non_matching:
+            ver = f" v{p.get('template_version', '?')}"
+            choices.append(questionary.Choice(
+                title=f"{p['name']} → {p['template_name']}{ver}  \033[93m(different template)\033[0m",
+                value=p["name"],
+            ))
+
     choices.append(questionary.Choice(title="Skip, answer manually", value=None))
 
     preset_name = questionary.select("Select preset:", choices=choices).unsafe_ask()
     if preset_name is None:
         return None
 
-    mismatch = check_preset_match(preset_name, template_name)
-    if mismatch:
+    if preset_name in [p["name"] for p in non_matching]:
+        mismatch = check_preset_match(preset_name, current_template_name)
         click.secho(f"\n  ⚠  {mismatch}", fg="yellow")
         proceed = questionary.confirm("Continue with this preset anyway?", default=False).unsafe_ask()
         if not proceed:
@@ -120,17 +138,19 @@ def _load_presets_interactive(template_name: str) -> Optional[dict]:
 
 
 def _resolve_preset(preset_name: str, template_name: str) -> Optional[dict]:
-    data = load_preset(preset_name)
-    if data is None:
-        click.secho(f"\n  Preset '{preset_name}' not found.", fg="red")
-        return None
-
+    """Load a preset by name. Returns None if not found; exits if mismatch and user declines."""
     mismatch = check_preset_match(preset_name, template_name)
     if mismatch:
         click.secho(f"\n  ⚠  {mismatch}", fg="yellow")
-        proceed = questionary.confirm("Continue with this preset anyway?", default=False).unsafe_ask()
+        click.secho("  The preset was created for a different template. Variables may not be compatible.\n", fg="yellow")
+        proceed = questionary.confirm("Continue anyway?", default=False).unsafe_ask()
         if not proceed:
             raise SystemExit(0)
+
+    data = load_preset(preset_name)
+    if data is None:
+        click.secho(f"\n  Preset '{preset_name}' not found.", fg="red")
+        raise SystemExit(1)
 
     return data
 
@@ -139,6 +159,8 @@ def _resolve_preset(preset_name: str, template_name: str) -> Optional[dict]:
 def main():
     pass
 
+
+# ── new ─────────────────────────────────────────────────────────────────────
 
 @main.command()
 @click.option("-t", "--template", default=None, help="Template name or path")
@@ -162,10 +184,7 @@ def new(template: Optional[str], output: Optional[str], preset: Optional[str],
     template_vars = {}
 
     if preset:
-        preset_data = _resolve_preset(preset, config.name)
-        if preset_data:
-            preset_vars = preset_data.get("variables", {})
-            click.secho(f"  Using preset: {preset}", fg="green")
+        preset_vars = _resolve_preset(preset, config.name).get("variables", {})
 
     if not preset_vars and not no_interactive:
         preset_data = _load_presets_interactive(config.name)
@@ -231,6 +250,8 @@ def new(template: Optional[str], output: Optional[str], preset: Optional[str],
     click.secho("\n  Done!", fg="green", bold=True)
 
 
+# ── list ────────────────────────────────────────────────────────────────────
+
 @main.command("list")
 def list_templates():
     """List available templates."""
@@ -245,10 +266,12 @@ def list_templates():
         click.secho("  No built-in templates found.", fg="yellow")
 
 
+# ── validate ────────────────────────────────────────────────────────────────
+
 @main.command()
 @click.option("-t", "--template", default=None, help="Template name or path")
-@click.option("--fix", is_flag=True, help="Attempt to auto-fix issues")
-def validate(template: Optional[str], fix: bool):
+@click.option("--ci", is_flag=True, help="CI mode: exit 0=clean, 1=errors found, 2=warnings only")
+def validate(template: Optional[str], ci: bool):
     """Validate a template configuration. Checks YAML, variables, conditions, rendering, and post-commands."""
     _print_banner()
 
@@ -260,39 +283,73 @@ def validate(template: Optional[str], fix: bool):
     issues = validate_template(template_info["path"])
     exit_code = print_validation_report(issues, config.name)
 
-    raise SystemExit(exit_code)
+    if ci:
+        raise SystemExit(exit_code)
 
+
+# ── preset ──────────────────────────────────────────────────────────────────
 
 @main.group()
 def preset_cmd():
-    """Manage presets."""
+    """Manage saved presets."""
     pass
 
 
 @preset_cmd.command("save")
-@click.argument("name")
-def preset_save(name: str):
-    """Save a preset (interactive)."""
+@click.argument("name", required=False)
+def preset_save(name: Optional[str]):
+    """Save a preset (interactive or by name)."""
+    if name:
+        preset_name = name
+    else:
+        preset_name = questionary.text("Preset name:").unsafe_ask()
+        if not preset_name.strip():
+            click.secho("Preset name cannot be empty.", fg="red")
+            return
+
+    _print_banner()
+
     builtin = discover_builtin_templates()
-    choices = [questionary.Choice(title=f"{t['name']} - {t['description']}", value=t) for t in builtin]
-    choices.append(questionary.Choice(title="External template...", value="__external__"))
-
-    selected = questionary.select("Select template:", choices=choices).unsafe_ask()
-
-    if selected == "__external__":
-        path_input = questionary.text("Path to template:").unsafe_ask()
+    if not builtin:
+        click.secho("No built-in templates found.", fg="yellow")
+        path_input = questionary.text("Path to external template:").unsafe_ask()
         ext = discover_external_template(path_input)
         if not ext:
             click.secho("Invalid template path.", fg="red")
             return
         template_info = ext
     else:
-        template_info = selected
+        choices = [questionary.Choice(title=f"{t['name']} - {t['description']}", value=t) for t in builtin]
+        choices.append(questionary.Choice(title="External template...", value="__external__"))
+
+        selected = questionary.select("Select template:", choices=choices).unsafe_ask()
+
+        if selected == "__external__":
+            path_input = questionary.text("Path to template:").unsafe_ask()
+            ext = discover_external_template(path_input)
+            if not ext:
+                click.secho("Invalid template path.", fg="red")
+                return
+            template_info = ext
+        else:
+            template_info = selected
 
     config = load_template_config(template_info["config_file"])
+    click.secho(f"\n  Template: {config.name} v{config.version}", fg="cyan")
+
+    existing = list_presets()
+    if any(p["name"] == preset_name for p in existing):
+        overwrite = questionary.confirm(
+            f"Preset '{preset_name}' already exists. Overwrite?", default=False
+        ).unsafe_ask()
+        if not overwrite:
+            return
+
     variables = collect_variables(config)
-    path = save_preset(name, config.name, config.version, variables)
-    click.secho(f"Preset saved: {path}", fg="green")
+    path = save_preset(preset_name, config.name, config.version, variables)
+    click.secho(f"\n  \033[92mPreset '{preset_name}' saved.\033[0m")
+    click.secho(f"  Template: {config.name} v{config.version}")
+    click.secho(f"  Path: {path}")
 
 
 @preset_cmd.command("list")
@@ -300,13 +357,32 @@ def preset_list():
     """List saved presets."""
     presets = list_presets()
     if not presets:
-        click.secho("No presets saved.", fg="yellow")
+        click.secho("No presets saved yet.", fg="yellow")
+        click.secho("Use 'template-gen preset save <name>' to create one.")
         return
 
-    click.secho("Saved presets:", fg="cyan", bold=True)
+    click.echo()
+    click.secho("  Saved presets:", fg="cyan", bold=True)
     for p in presets:
         ver = f" v{p['template_version']}" if p.get("template_version") else ""
-        click.echo(f"  • {p['name']} → {p['template_name']}{ver}")
+        click.echo(f"    • \033[1m{p['name']}\033[0m  →  {p['template_name']}{ver}")
+
+
+@preset_cmd.command("show")
+@click.argument("name")
+def preset_show(name: str):
+    """Show the contents of a preset."""
+    data = load_preset(name)
+    if not data:
+        click.secho(f"Preset '{name}' not found.", fg="red")
+        return
+
+    click.echo()
+    click.secho(f"  Preset: \033[1m{data['name']}\033[0m", fg="cyan")
+    click.secho(f"  Template: {data.get('template_name', 'N/A')}  v{data.get('template_version', '?')}")
+    click.secho(f"  Variables ({len(data.get('variables', {}))}):", fg="cyan")
+    for k, v in data.get("variables", {}).items():
+        click.echo(f"    {k} = {v}")
 
 
 @preset_cmd.command("delete")
@@ -319,21 +395,61 @@ def preset_delete(name: str):
         click.secho(f"Preset '{name}' not found.", fg="red")
 
 
-@preset_cmd.command("show")
-@click.argument("name")
-def preset_show(name: str):
-    """Show the contents of a preset."""
-    data = load_preset(name)
-    if not data:
-        click.secho(f"Preset '{name}' not found.", fg="red")
-        return
+# ── diff ────────────────────────────────────────────────────────────────────
 
-    click.secho(f"Preset: {data['name']}", fg="cyan", bold=True)
-    click.secho(f"Template: {data.get('template_name', 'N/A')}  v{data.get('template_version', '?')}", fg="cyan")
-    click.secho("Variables:", fg="cyan")
-    for k, v in data.get("variables", {}).items():
-        click.echo(f"  {k} = {v}")
+@main.command()
+@click.argument("project_dir")
+@click.option("-t", "--template", required=True, help="Template name or path")
+@click.option("--no-interactive", is_flag=True, help="Use defaults for all variables")
+def diff(project_dir: str, template: str, no_interactive: bool):
+    """Preview changes between current project and updated template without applying them."""
+    _print_banner()
 
+    project_path = Path(project_dir).resolve()
+    if not project_path.exists():
+        click.secho(f"Project directory not found: {project_dir}", fg="red")
+        raise SystemExit(1)
+
+    manifest = load_manifest(str(project_path))
+    template_info = _resolve_template(template)
+    config = load_template_config(template_info["config_file"])
+
+    if manifest:
+        click.secho(f"  Manifest found: {manifest.get('template_name')} v{manifest.get('template_version')}", fg="cyan")
+
+    click.secho(f"  Comparing with: {config.name} v{config.version}", fg="cyan")
+
+    preset_vars = None
+    if manifest and manifest.get("variables"):
+        if not no_interactive:
+            reuse = questionary.confirm(
+                "Reuse variables from existing manifest?", default=True
+            ).unsafe_ask()
+            if reuse:
+                preset_vars = manifest.get("variables", {})
+
+    if not preset_vars and not no_interactive:
+        preset_data = _load_presets_interactive(config.name)
+        if preset_data:
+            preset_vars = preset_data.get("variables", {})
+
+    if no_interactive and not preset_vars:
+        template_vars = {var.name: var.default for var in config.variables}
+    else:
+        template_vars = collect_variables(config, presets=preset_vars)
+
+    rendered = render_project(
+        template_dir=template_info["path"],
+        output_dir="",
+        context=template_vars,
+        dry_run=True,
+    )
+
+    print_diff_preview(str(project_path), rendered, config.name, config.version)
+    click.secho("  Run 'template-gen update' to apply these changes.", fg="cyan", bold=True)
+
+
+# ── update ──────────────────────────────────────────────────────────────────
 
 @main.command()
 @click.argument("project_dir")
@@ -355,20 +471,19 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
     config = load_template_config(template_info["config_file"])
 
     if manifest:
-        existing_name = manifest.get("template_name", "")
-        existing_ver = manifest.get("template_version", "")
-        click.secho(f"\n  Existing project was generated from: {existing_name} v{existing_ver}", fg="cyan")
+        click.secho(f"\n  Existing: {manifest.get('template_name')} v{manifest.get('template_version')}", fg="cyan")
 
-    click.secho(f"  Updating from template: {config.name} v{config.version}", fg="cyan")
+    click.secho(f"  Updating from: {config.name} v{config.version}", fg="cyan")
 
     preset_vars = None
     if manifest and manifest.get("variables"):
-        reuse = not no_interactive and questionary.confirm(
-            "Reuse variables from existing manifest?", default=True
-        ).unsafe_ask()
-        if reuse:
-            preset_vars = manifest.get("variables", {})
-            click.secho("  Using variables from existing manifest.", fg="green")
+        if not no_interactive:
+            reuse = questionary.confirm(
+                "Reuse variables from existing manifest?", default=True
+            ).unsafe_ask()
+            if reuse:
+                preset_vars = manifest.get("variables", {})
+                click.secho("  Using variables from existing manifest.", fg="green")
 
     if not preset_vars and not no_interactive:
         preset_data = _load_presets_interactive(config.name)
@@ -396,7 +511,8 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
         interactive=not no_interactive,
     )
 
-    if not dry_run and (result["changed"] or result["added"]):
+    if not dry_run and (result["changed"] or result["added"] or result["skipped"]):
+        classification = result.get("classifications", {})
         update_manifest_after_update(
             project_dir=str(project_path),
             template_name=config.name,
@@ -405,17 +521,18 @@ def update(project_dir: str, template: str, no_backup: bool, no_interactive: boo
             new_render=rendered,
             classifications={
                 "unchanged": result.get("unchanged", []),
-                "changed": result["changed"],
-                "template_new": result["added"],
+                "changed": result.get("changed", []),
+                "template_new": result.get("added", []),
                 "template_removed": result.get("removed", []),
                 "user_only": result.get("user_only", []),
+                "skipped": result.get("skipped", []),
             },
         )
 
     if result["backup"]:
         click.secho(f"\n  Backup: {result['backup']}", fg="cyan")
 
-    click.secho("\n  Update complete!", fg="green")
+    click.secho("  Update complete!", fg="green")
 
 
 if __name__ == "__main__":
