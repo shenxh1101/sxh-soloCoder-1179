@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "template-gen"
+version = "0.1.0"
+description = "A Python command-line project template generator with custom Q&A and conditional logic"
+authors = []
+readme = "README.md"
+license = "MIT"
+packages = [{include = "template_gen"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+click = "^8.0"
+pyyaml = "^6.0"
+jinja2 = "^3.1"
+questionary = "^2.0"
+pydantic = "^2.0"
+rich = "^13.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+black = "^23.0"
+ruff = "^0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+template-gen = "template_gen.cli:main"

@@ -1,0 +1,9 @@
+{% if cli_framework == 'click' %}
+click>=8.0
+{% elif cli_framework == 'typer' %}
+typer>=0.9
+{% endif %}
+pyyaml>=6.0
+{% if use_tests %}
+pytest>=7.0
+{% endif %}

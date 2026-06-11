@@ -1,0 +1,69 @@
+{% if cli_framework == 'click' %}
+import click
+
+
+@click.group()
+def main():
+    """{{ project_name }} - {{ description | default('A CLI tool') }}"""
+    pass
+
+
+@main.command()
+def hello():
+    """Say hello."""
+    click.echo("Hello from {{ project_name }}!")
+
+
+if __name__ == "__main__":
+    main()
+{% elif cli_framework == 'typer' %}
+import typer
+
+app = typer.Typer(
+    name="{{ project_name }}",
+    help="{{ description | default('A CLI tool') }}",
+)
+
+
+@app.command()
+def hello():
+    """Say hello."""
+    typer.echo("Hello from {{ project_name }}!")
+
+
+def main():
+    app()
+
+
+if __name__ == "__main__":
+    main()
+{% else %}
+import argparse
+{% if use_logging %}
+from {{ project_name }}.logging_config import setup_logging
+{% endif %}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="{{ description | default('A CLI tool') }}",
+    )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--name", default="World", help="Name to greet")
+
+{% if use_logging %}
+    parser.add_argument("--log-level", default="{{ log_level }}", help="Log level")
+{% endif %}
+
+    args = parser.parse_args()
+
+{% if use_logging %}
+    setup_logging(args.log_level)
+{% endif %}
+
+    print(f"Hello, {args.name}!")
+
+
+if __name__ == "__main__":
+    main()
+{% endif %}

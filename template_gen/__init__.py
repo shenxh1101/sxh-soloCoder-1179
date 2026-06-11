@@ -1,0 +1,1 @@
+"""template-gen: A Python command-line project template generator."""

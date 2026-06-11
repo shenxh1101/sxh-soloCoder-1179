@@ -1,0 +1,81 @@
+name: "FastAPI Scaffold"
+description: "A production-ready FastAPI project with Docker support"
+version: "1.0"
+
+variables:
+  - name: project_name
+    prompt: "Project name:"
+    default: "my-fastapi-app"
+    kind: text
+    validation:
+      kind: regex
+      pattern: "^[a-zA-Z][a-zA-Z0-9_-]+$"
+      message: "Project name must start with a letter and contain only letters, digits, hyphens, and underscores"
+
+  - name: author
+    prompt: "Author name:"
+    default: "Developer"
+    kind: text
+
+  - name: python_version
+    prompt: "Python version:"
+    default: "3.11"
+    kind: select
+    choices:
+      - title: "Python 3.11"
+        value: "3.11"
+      - title: "Python 3.12"
+        value: "3.12"
+      - title: "Python 3.10"
+        value: "3.10"
+
+  - name: use_docker
+    prompt: "Add Docker support?"
+    default: true
+    kind: confirm
+
+  - name: docker_port
+    prompt: "Docker exposed port:"
+    default: 8000
+    kind: int
+    condition: "use_docker == true"
+    validation:
+      kind: range
+      min_value: 1
+      max_value: 65535
+      message: "Port must be between 1 and 65535"
+
+  - name: use_database
+    prompt: "Include database setup (SQLAlchemy + Alembic)?"
+    default: true
+    kind: confirm
+
+  - name: db_type
+    prompt: "Database type:"
+    default: "postgresql"
+    kind: select
+    condition: "use_database == true"
+    choices:
+      - title: "PostgreSQL"
+        value: "postgresql"
+      - title: "MySQL"
+        value: "mysql"
+      - title: "SQLite"
+        value: "sqlite"
+
+  - name: use_tests
+    prompt: "Include test setup (pytest)?"
+    default: true
+    kind: confirm
+
+post_commands:
+  - command: "git init"
+    description: "Initialize git repository"
+
+  - command: "pip install -r requirements.txt"
+    description: "Install Python dependencies"
+    condition: "use_docker == false"
+
+  - command: "docker-compose build"
+    description: "Build Docker images"
+    condition: "use_docker == true"

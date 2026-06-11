@@ -1,0 +1,77 @@
+name: "CLI Tool"
+description: "A Click-based command-line tool scaffold with argparse fallback"
+version: "1.0"
+
+variables:
+  - name: project_name
+    prompt: "Project name:"
+    default: "my-cli-tool"
+    kind: text
+    validation:
+      kind: regex
+      pattern: "^[a-zA-Z][a-zA-Z0-9_-]+$"
+      message: "Project name must start with a letter and contain only letters, digits, hyphens, and underscores"
+
+  - name: author
+    prompt: "Author name:"
+    default: "Developer"
+    kind: text
+
+  - name: python_version
+    prompt: "Python version:"
+    default: "3.11"
+    kind: select
+    choices:
+      - title: "Python 3.11"
+        value: "3.11"
+      - title: "Python 3.12"
+        value: "3.12"
+      - title: "Python 3.10"
+        value: "3.10"
+
+  - name: cli_framework
+    prompt: "CLI framework:"
+    default: "click"
+    kind: select
+    choices:
+      - title: "Click"
+        value: "click"
+      - title: "Typer"
+        value: "typer"
+      - title: "argparse (stdlib)"
+        value: "argparse"
+
+  - name: use_logging
+    prompt: "Add structured logging?"
+    default: true
+    kind: confirm
+
+  - name: log_level
+    prompt: "Default log level:"
+    default: "INFO"
+    kind: select
+    condition: "use_logging == true"
+    choices:
+      - title: "DEBUG"
+        value: "DEBUG"
+      - title: "INFO"
+        value: "INFO"
+      - title: "WARNING"
+        value: "WARNING"
+
+  - name: use_config_file
+    prompt: "Include YAML config file support?"
+    default: true
+    kind: confirm
+
+  - name: use_tests
+    prompt: "Include test setup (pytest)?"
+    default: true
+    kind: confirm
+
+post_commands:
+  - command: "git init"
+    description: "Initialize git repository"
+
+  - command: "pip install -e ."
+    description: "Install package in development mode"
