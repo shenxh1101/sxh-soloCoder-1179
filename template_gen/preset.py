@@ -1,7 +1,6 @@
 """Preset save/load system for reusing project generation choices."""
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +12,12 @@ def get_preset_dir() -> Path:
     return preset_dir
 
 
-def save_preset(name: str, template_name: str, variables: Dict[str, Any]) -> str:
+def save_preset(
+    name: str,
+    template_name: str,
+    template_version: str,
+    variables: Dict[str, Any],
+) -> str:
     """Save a preset to disk. Returns the preset file path."""
     preset_dir = get_preset_dir()
     safe_name = _safe_filename(name)
@@ -22,6 +26,7 @@ def save_preset(name: str, template_name: str, variables: Dict[str, Any]) -> str
     data = {
         "name": name,
         "template_name": template_name,
+        "template_version": template_version,
         "variables": variables,
     }
     with open(filepath, "w", encoding="utf-8") as f:
@@ -43,6 +48,27 @@ def load_preset(name: str) -> Optional[Dict[str, Any]]:
         return json.load(f)
 
 
+def check_preset_match(
+    preset_name: str,
+    current_template_name: str,
+) -> Optional[str]:
+    """
+    Check if a preset matches the current template. Returns None if ok,
+    or an error message string if there is a mismatch.
+    """
+    data = load_preset(preset_name)
+    if data is None:
+        return f"Preset '{preset_name}' not found."
+
+    preset_template = data.get("template_name", "")
+    if preset_template.lower() != current_template_name.lower():
+        return (
+            f"Preset '{preset_name}' was created for template '{preset_template}', "
+            f"but you selected '{current_template_name}'. Variables may not be compatible."
+        )
+    return None
+
+
 def list_presets() -> List[Dict[str, str]]:
     """List all saved presets."""
     preset_dir = get_preset_dir()
@@ -56,6 +82,7 @@ def list_presets() -> List[Dict[str, str]]:
                 "name": data.get("name", entry.stem),
                 "filename": entry.name,
                 "template_name": data.get("template_name", ""),
+                "template_version": data.get("template_version", ""),
                 "path": str(entry),
             })
         except (json.JSONDecodeError, KeyError):

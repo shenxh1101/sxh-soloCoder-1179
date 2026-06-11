@@ -1,11 +1,15 @@
 """Incremental updater: compares template render with existing project, backs up user changes."""
 
 import datetime
-import filecmp
+import difflib
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
+
+from template_gen.manifest import classify_project_files, update_manifest_after_update
+
+MANIFEST_FILENAME = ".template_gen_manifest.json"
 
 
 def backup_project(project_dir: str) -> str:
@@ -14,51 +18,13 @@ def backup_project(project_dir: str) -> str:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = project_path.parent / f"{project_path.name}.backup_{timestamp}"
 
-    shutil.copytree(project_path, backup_dir)
+    shutil.copytree(project_path, backup_dir, ignore=_backup_ignore)
     return str(backup_dir)
 
 
-def compute_diff(
-    project_dir: str,
-    new_files: Dict[str, str],
-) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """
-    Compare existing project files with newly rendered template output.
-    Returns (unchanged, changed, added, removed) file lists (relative paths).
-    """
-    project_path = Path(project_dir).resolve()
-    unchanged: List[str] = []
-    changed: List[str] = []
-    added: List[str] = []
-    removed: List[str] = []
-
-    existing_files = set()
-    for root, dirs, files in os.walk(project_path):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "venv", "node_modules")]
-        for f in files:
-            if f.endswith((".pyc", ".pyo")):
-                continue
-            rel = os.path.relpath(os.path.join(root, f), project_path)
-            rel = rel.replace("\\", "/")
-            existing_files.add(rel)
-
-    new_file_paths = set(new_files.keys())
-
-    for rel_path in existing_files & new_file_paths:
-        current_path = project_path / rel_path
-        current_content = current_path.read_text(encoding="utf-8") if current_path.exists() else ""
-        new_content = new_files[rel_path]
-
-        if current_content == new_content:
-            unchanged.append(rel_path)
-        else:
-            changed.append(rel_path)
-
-    for rel_path in new_file_paths - existing_files:
-        added.append(rel_path)
-
-    removed = list(existing_files - new_file_paths)
-    return unchanged, changed, added, removed
+def _backup_ignore(directory: str, files: List[str]) -> List[str]:
+    ignore = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"}
+    return [f for f in files if f in ignore or f.endswith((".pyc", ".pyo"))]
 
 
 def incremental_update(
@@ -69,17 +35,26 @@ def incremental_update(
     interactive: bool = True,
 ) -> Dict[str, Any]:
     """
-    Incrementally update a project. Backs up the project first, then overwrites
-    only changed/new template files. If interactive, prompts for each conflicted file.
+    Incrementally update a project. Uses manifest to distinguish template
+    files from user-created files. Backs up the project first, then overwrites
+    only changed/new template files. User-only files are always protected.
     """
     project_path = Path(project_dir).resolve()
 
     if not project_path.exists():
         raise FileNotFoundError(f"Project directory not found: {project_dir}")
 
-    unchanged, changed, added, removed = compute_diff(project_dir, new_files)
+    classification = classify_project_files(project_dir, new_files)
 
-    if not changed and not added and not removed:
+    unchanged = classification["unchanged"]
+    changed = classification["changed"]
+    template_new = classification["template_new"]
+    template_removed = classification["template_removed"]
+    user_only = classification["user_only"]
+
+    has_changes = changed or template_new or template_removed or user_only
+
+    if not has_changes:
         return {
             "backup": None,
             "unchanged": unchanged,
@@ -87,6 +62,7 @@ def incremental_update(
             "added": [],
             "removed": [],
             "skipped": [],
+            "user_only": user_only,
         }
 
     if backup and not dry_run:
@@ -97,99 +73,125 @@ def incremental_update(
     skipped: List[str] = []
     applied_changed: List[str] = []
     applied_added: List[str] = []
+    applied_removed: List[str] = []
 
-    print(f"\n  Template changes detected:")
-    if changed:
-        print(f"    \033[93m{len(changed)} file(s) modified\033[0m")
-    if added:
-        print(f"    \033[92m{len(added)} file(s) added\033[0m")
-    if removed:
-        print(f"    \033[91m{len(removed)} file(s) not in template\033[0m")
-    if backup_dir:
-        print(f"  \033[90mBackup created at: {backup_dir}\033[0m")
+    _print_change_summary(changed, template_new, template_removed, user_only, backup_dir)
 
-    if interactive and changed:
-        print(f"\n  Files with conflicts ({len(changed)}):")
-        for rel_path in changed:
-            print(f"    - {rel_path}")
-
-        answer = input(f"\n  Apply changes to {len(changed)} file(s)? [Y/n] ").strip().lower()
-        if answer in ("n", "no"):
-            print("  \033[93mSkipped all changed files.\033[0m")
-            return {
-                "backup": backup_dir,
-                "unchanged": unchanged,
-                "changed": [],
-                "added": applied_added,
-                "removed": [],
-                "skipped": changed,
-            }
+    if user_only:
+        print(f"    \033[96m{len(user_only)} user file(s) — always protected\033[0m")
 
     for rel_path in changed:
-        if interactive:
-            ans = input(f"  Overwrite '{rel_path}'? [Y/n/s=show diff] ").strip().lower()
-            if ans == "s":
-                _show_diff(project_path, rel_path, new_files[rel_path])
-                ans = input(f"  Overwrite '{rel_path}'? [Y/n] ").strip().lower()
-            if ans in ("n", "no"):
-                skipped.append(rel_path)
-                continue
+        apply = _ask_file_action(rel_path, "overwrite", project_path, new_files.get(rel_path), interactive, dry_run)
+        if apply:
+            if not dry_run:
+                target = project_path / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(new_files[rel_path], encoding="utf-8")
+            applied_changed.append(rel_path)
+        else:
+            skipped.append(rel_path)
 
-        if not dry_run:
-            target = project_path / rel_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(new_files[rel_path], encoding="utf-8")
-        applied_changed.append(rel_path)
+    for rel_path in template_new:
+        apply = _ask_file_action(rel_path, "add", project_path, new_files.get(rel_path), interactive, dry_run)
+        if apply:
+            if not dry_run:
+                target = project_path / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(new_files[rel_path], encoding="utf-8")
+            applied_added.append(rel_path)
+        else:
+            skipped.append(rel_path)
 
-    for rel_path in added:
-        if interactive:
-            ans = input(f"  Add new file '{rel_path}'? [Y/n] ").strip().lower()
-            if ans in ("n", "no"):
-                skipped.append(rel_path)
-                continue
+    for rel_path in template_removed:
+        apply = _ask_file_action(rel_path, "remove", project_path, None, interactive, dry_run)
+        if apply:
+            if not dry_run:
+                target = project_path / rel_path
+                if target.exists():
+                    target.unlink()
+            applied_removed.append(rel_path)
+        else:
+            skipped.append(rel_path)
 
-        if not dry_run:
-            target = project_path / rel_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(new_files[rel_path], encoding="utf-8")
-        applied_added.append(rel_path)
-
-    for rel_path in removed:
-        if interactive:
-            ans = input(f"  Remove '{rel_path}' (no longer in template)? [y/N] ").strip().lower()
-            if ans not in ("y", "yes"):
-                skipped.append(rel_path)
-                continue
-
-        if not dry_run:
-            target = project_path / rel_path
-            if target.exists():
-                target.unlink()
-
-    print(f"\n  \033[92mUpdate complete.\033[0m")
-    print(f"    {len(applied_changed)} file(s) updated")
-    print(f"    {len(applied_added)} file(s) added")
-    if skipped:
-        print(f"    {len(skipped)} file(s) skipped")
+    _print_result_summary(applied_changed, applied_added, applied_removed, skipped, user_only)
 
     return {
         "backup": backup_dir,
         "unchanged": unchanged,
         "changed": applied_changed,
-        "added": applied_added,
-        "removed": applied_added,
+        "added": applied_added + applied_removed,
+        "removed": applied_removed,
         "skipped": skipped,
+        "user_only": user_only,
     }
 
 
-def _show_diff(project_path: Path, rel_path: str, new_content: str) -> None:
+def _print_change_summary(
+    changed: List[str],
+    template_new: List[str],
+    template_removed: List[str],
+    user_only: List[str],
+    backup_dir: Optional[str],
+) -> None:
+    print(f"\n  \033[1mChange Summary\033[0m")
+    if changed:
+        print(f"    \033[93m{len(changed)} file(s) modified by template\033[0m")
+        for f in changed:
+            print(f"      M  {f}")
+    if template_new:
+        print(f"    \033[92m{len(template_new)} file(s) new from template\033[0m")
+        for f in template_new:
+            print(f"      +  {f}")
+    if template_removed:
+        print(f"    \033[91m{len(template_removed)} file(s) removed from template\033[0m")
+        for f in template_removed:
+            print(f"      -  {f}")
+    if user_only:
+        print(f"    \033[96m{len(user_only)} user-created file(s) — will not be touched\033[0m")
+        for f in user_only:
+            print(f"      ?  {f}")
+    if backup_dir:
+        print(f"  \033[90mBackup: {backup_dir}\033[0m")
+
+
+def _ask_file_action(
+    rel_path: str,
+    action: str,
+    project_path: Path,
+    new_content: Optional[str],
+    interactive: bool,
+    dry_run: bool,
+) -> bool:
+    if not interactive:
+        if action == "remove":
+            return False
+        return True
+
+    if action == "overwrite":
+        prompt = f"  Overwrite '{rel_path}'? [Y/n/s=show diff] "
+    elif action == "add":
+        prompt = f"  Add new file '{rel_path}'? [Y/n] "
+    else:
+        prompt = f"  Remove '{rel_path}'? [y/N] "
+
+    ans = input(prompt).strip().lower()
+
+    if ans == "s" and action == "overwrite" and new_content is not None:
+        _show_file_diff(project_path, rel_path, new_content)
+        ans = input(f"  Overwrite '{rel_path}'? [Y/n] ").strip().lower()
+
+    if action == "remove":
+        return ans in ("y", "yes")
+    return ans not in ("n", "no")
+
+
+def _show_file_diff(project_path: Path, rel_path: str, new_content: str) -> None:
     current_path = project_path / rel_path
     if current_path.exists():
         current_content = current_path.read_text(encoding="utf-8")
     else:
         current_content = "(new file)"
 
-    import difflib
     diff = difflib.unified_diff(
         current_content.splitlines(keepends=True),
         new_content.splitlines(keepends=True),
@@ -197,3 +199,23 @@ def _show_diff(project_path: Path, rel_path: str, new_content: str) -> None:
         tofile=f"b/{rel_path} (new template)",
     )
     print("  \033[90m" + "".join(diff) + "\033[0m")
+
+
+def _print_result_summary(
+    applied_changed: List[str],
+    applied_added: List[str],
+    applied_removed: List[str],
+    skipped: List[str],
+    user_only: List[str],
+) -> None:
+    print(f"\n  \033[92mUpdate complete.\033[0m")
+    if applied_changed:
+        print(f"    {len(applied_changed)} file(s) updated")
+    if applied_added:
+        print(f"    {len(applied_added)} file(s) added")
+    if applied_removed:
+        print(f"    {len(applied_removed)} file(s) removed")
+    if skipped:
+        print(f"    {len(skipped)} file(s) skipped")
+    if user_only:
+        print(f"    {len(user_only)} user file(s) preserved")
